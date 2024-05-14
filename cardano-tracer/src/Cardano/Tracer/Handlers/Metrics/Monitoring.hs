@@ -1,3 +1,5 @@
+{-# Options_GHC -w #-}
+
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -10,23 +12,49 @@ module Cardano.Tracer.Handlers.Metrics.Monitoring
 import           Cardano.Tracer.Configuration
 import           Cardano.Tracer.Environment
 import           Cardano.Tracer.Handlers.RTView.SSL.Certs
+import           Cardano.Tracer.MetaTrace
 import           Cardano.Tracer.Types
 
+import Data.String
 import           Control.Concurrent (ThreadId)
 import           Control.Concurrent.STM (atomically)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, tryReadTMVar)
 import           Control.Concurrent.STM.TVar (readTVarIO)
 import           Control.Monad (forM, void)
 import           Control.Monad.Extra (whenJust)
+import           Control.Monad.IO.Class (liftIO)
+import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
+import Data.Foldable
 import           Data.Text.Encoding (encodeUtf8)
 import           System.Remote.Monitoring (forkServerWith, serverThreadId)
 import           System.Time.Extra (sleep)
 
+import Text.Blaze.Html5 hiding (title)
+import Text.Blaze.Html5.Attributes 
+import           Snap.Blaze (blaze)
+import           Snap.Core (Snap, getRequest, route, rqParams, writeText, writeLBS)
+import           Snap.Http.Server (Config, ConfigLog (..), defaultConfig, setAccessLog, setBind,
+                   setErrorLog, setPort, simpleHttpServe)
+
+
+-- DON'T USE, directly write in HTML
+--
+-- restartEKGServer must be done differently
+--
+-- Only one endpoint being used, currently.
+-- Factor out three penny gui.
+-- Don't react to "click" with Haskell code. Add handlers to generated HTML so it sends
+-- little requiests back.
+--
+-- For now, regenerate what we have in HTML.
+-- Smart restarting EKG service, later.
+#ifdef RTVIEW
 import qualified Graphics.UI.Threepenny as UI
 import           Graphics.UI.Threepenny.Core (Element, UI, liftIO, set, (#), (#+))
+#endif
 
 -- | 'ekg' package allows to run only one EKG server, to display only one web page
 --   for particular EKG.Store. Since 'cardano-tracer' can be connected to any number
@@ -42,11 +70,17 @@ runMonitoringServer
   :: TracerEnv
   -> (Endpoint, Endpoint) -- ^ (web page with list of connected nodes, EKG web page).
   -> IO ()
-runMonitoringServer tracerEnv (Endpoint listHost listPort, monitorEP) = do
+#ifdef RTVIEW
+runMonitoringServer tracerEnv (endpoint@(Endpoint listHost listPort), monitorEP) = do
+
   -- Pause to prevent collision between "Listening"-notifications from servers.
   sleep 0.2
   (certFile, keyFile) <- placeDefaultSSLFiles tracerEnv
-  UI.startGUI (config certFile keyFile) $ \window -> do
+  traceWith (teTracer tracerEnv) TracerStartedMonitoring
+    { ttMonitoringEndpoint = endpoint
+    , ttMonitoringType     = "list"
+    }
+  UI.startGUI (config certFile keyFile) \window -> do
     void $ return window # set UI.title "EKG Monitoring Nodes"
     void $ mkPageBody window tracerEnv monitorEP
  where
@@ -62,9 +96,96 @@ runMonitoringServer tracerEnv (Endpoint listHost listPort, monitorEP) = do
             , UI.jsSSLChainCert = False
             }
       }
+#else
+runMonitoringServer tracerEnv (endpoint@(Endpoint listHost listPort), monitorEP) = do
+  -- Pause to prevent collision between "Listening"-notifications from servers.
+  sleep 0.2
+  -- Reintroduce later.
+  -- (_certFile, _keyFile) <- placeDefaultSSLFiles tracerEnv
+  traceWith (teTracer tracerEnv) TracerStartedMonitoring
+    { ttMonitoringEndpoint = endpoint
+    , ttMonitoringType     = "list"
+    }
+  simpleHttpServe config $
+    route [ ("/",          renderDummy)
+          -- , ("/:nodename", renderDummy)
+          ]
+ where
+  TracerEnv{teConnectedNodes} = tracerEnv
 
+  config :: Config Snap ()
+  config =
+      setPort (fromIntegral listPort)
+    . setBind (encodeUtf8 . T.pack $ listHost)
+    . setAccessLog (ConfigFileLog "/tmp/snap_acc.log") --O
+--O    . setAccessLog ConfigNoLog
+    . setErrorLog (ConfigFileLog "/tmp/snap_err.log") --O
+--O    . setErrorLog ConfigNoLog
+    $ defaultConfig
+
+  renderDummy :: Snap ()
+  renderDummy = do
+    nodes <- liftIO $ S.toList <$> readTVarIO teConnectedNodes
+    blaze do
+      docTypeHtml do
+        mkDummy monitorEP nodes
+
+mkDummy 
+  :: Endpoint
+  -> [NodeId]
+  -> Html
+mkDummy (Endpoint monitorHost monitorPort) = \case
+  [] -> 
+    toHtml @T.Text "mkDummy: There are no connected nodes yet"
+  connectedNodes -> 
+    for_ connectedNodes \nodeId@(NodeId anId) -> 
+      li do
+        a ! href (fromString ("http://" <> monitorHost <> ":" <> show monitorPort))
+          ! target "_blank"
+          ! title "Open EKG monitor page for this node"
+          $ toHtml anId
+
+    -- writeText "EKG Monitoring: Render dummy."
+    -- nIdsWithNames <- liftIO $ readTVarIO teConnectedNodesNames
+    -- if BM.null nIdsWithNames
+    --   else blaze . mkPage . map mkHref $ BM.toList nIdsWithNames
+
+ --  UI.startGUI (config certFile keyFile) \window -> do
+ --    void $ return window # set UI.title "EKG Monitoring Nodes"
+ --    void $ mkPageBody window tracerEnv monitorEP
+ -- where
+ --  config cert key =
+ --    UI.defaultConfig
+ --      { UI.jsLog    = const $ return ()
+ --      , UI.jsUseSSL =
+ --          Just $ UI.ConfigSSL
+ --            { UI.jsSSLBind = encodeUtf8 $ T.pack listHost
+ --            , UI.jsSSLPort = fromIntegral listPort
+ --            , UI.jsSSLCert = cert
+ --            , UI.jsSSLKey  = key
+ --            , UI.jsSSLChainCert = False
+ --            }
+ --      }
+
+#endif
+
+#ifdef RTVIEW
 -- | We have to keep an id of the node as well as thread id of currently launched EKG server.
 type CurrentEKGServer = TMVar (NodeId, ThreadId)
+              
+  -- currentServer :: CurrentEKGServer <- liftIO newEmptyTMVarIO
+        -- void $ UI.on UI.click nodeLink $ const $
+        --    restartEKGServer
+        --      tracerEnv nodeId mEP currentServer
+    --      return $ UI.element nodeLink
+    -- UI.ul #+ nodesLinks
+
+    --         -- TODO: Work around when we remove Threepenny GUI.
+    --         -- Possible workaround, 
+    --         --  + generate HTML such that clicking on a link, results in a POST request to the snap server.
+    --         --   + Register at least one separate handler for the Snap server.
+    --         --   + POST gets sent to that /..
+    --         --  + Needs to get the TracerEnv.
 
 -- | The first web page contains only the list of hrefs
 --   corresponding to currently connected nodes.
@@ -81,7 +202,7 @@ mkPageBody window tracerEnv mEP@(Endpoint monitorHost monitorPort) = do
       else do
         currentServer :: CurrentEKGServer <- liftIO newEmptyTMVarIO
         nodesLinks <-
-          forM nodes $ \nodeId@(NodeId anId) -> do
+          forM nodes \nodeId@(NodeId anId) -> do
             nodeLink <-
               UI.li #+
                 [ UI.anchor # set UI.href ("http://" <> monitorHost <> ":" <> show monitorPort)
@@ -89,8 +210,15 @@ mkPageBody window tracerEnv mEP@(Endpoint monitorHost monitorPort) = do
                             # set UI.title__ "Open EKG monitor page for this node"
                             # set UI.text (T.unpack anId)
                 ]
+            -- TODO: Work around when we remove Threepenny GUI.
+            -- Possible workaround, 
+            --  + generate HTML such that clicking on a link, results in a POST request to the snap server.
+            --   + Register at least one separate handler for the Snap server.
+            --   + POST gets sent to that /..
+            --  + Needs to get the TracerEnv.
             void $ UI.on UI.click nodeLink $ const $
-              restartEKGServer tracerEnv nodeId mEP currentServer
+              restartEKGServer
+                tracerEnv nodeId mEP currentServer
             return $ UI.element nodeLink
         UI.ul #+ nodesLinks
   UI.getBody window #+ [ UI.element nodesHrefs ]
@@ -106,16 +234,16 @@ restartEKGServer
   -> Endpoint
   -> CurrentEKGServer
   -> UI ()
-restartEKGServer TracerEnv{teAcceptedMetrics} newNodeId
-                 (Endpoint monitorHost monitorPort) currentServer = liftIO $ do
+restartEKGServer TracerEnv{teAcceptedMetrics, teTracer} newNodeId
+                 endpoint@(Endpoint monitorHost monitorPort) currentServer = liftIO do
   metrics <- readTVarIO teAcceptedMetrics
-  whenJust (metrics M.!? newNodeId) $ \(storeForSelectedNode, _) ->
+  whenJust (metrics M.!? newNodeId) \(storeForSelectedNode, _) ->
     atomically (tryReadTMVar currentServer) >>= \case
       Just (_curNodeId, _sThread) ->
         -- TODO: Currently we cannot restart EKG server,
         -- please see https://github.com/tibbe/ekg/issues/87
         return ()
-        -- unless (newNodeId == curNodeId) $ do
+        -- unless (newNodeId == curNodeId) do
         --   killThread sThread
         --   runEKGAndSave storeForSelectedNode
       Nothing ->
@@ -123,8 +251,13 @@ restartEKGServer TracerEnv{teAcceptedMetrics} newNodeId
         runEKGAndSave storeForSelectedNode
  where
   runEKGAndSave store = do
+    traceWith teTracer TracerStartedMonitoring
+      { ttMonitoringEndpoint = endpoint
+      , ttMonitoringType     = "monitor"
+      }
     ekgServer <- forkServerWith store
                    (encodeUtf8 . T.pack $ monitorHost)
                    (fromIntegral monitorPort)
     atomically do
       putTMVar currentServer (newNodeId, serverThreadId ekgServer)
+#endif

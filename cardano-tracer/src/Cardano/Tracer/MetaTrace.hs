@@ -45,6 +45,12 @@ data TracerTrace
   | TracerInitDone
   | TracerStartedLogRotator
   | TracerStartedPrometheus
+    { ttPrometheusEndpoint   :: !Endpoint
+    }
+  | TracerStartedMonitoring
+    { ttMonitoringEndpoint   :: !Endpoint
+    , ttMonitoringType       :: !Text 
+    }
   | TracerStartedAcceptors
     { ttAcceptorsAddr        :: !Network }
   | TracerStartedRTView
@@ -86,8 +92,13 @@ instance ToJSON TracerTrace where
         ("kind" .= ("TracerInitDone" :: Text))
     TracerStartedLogRotator -> pairs
         ("kind" .= ("TracerStartedLogRotator" :: Text))
-    TracerStartedPrometheus -> pairs
-        ("kind" .= ("TracerStartedPrometheus" :: Text))
+    TracerStartedPrometheus{..} -> pairs
+        ("kind" .= ("TracerStartedPrometheus" :: Text)
+      <> "endpoint" .= ttPrometheusEndpoint)
+    TracerStartedMonitoring{..} -> pairs
+        ("kind" .= ("TracerStartedPrometheus" :: Text)
+      <> "endpoint" .= ttMonitoringEndpoint
+      <> "type" .= ttMonitoringType)
     TracerStartedAcceptors{..} -> pairs
         ("kind" .= ("TracerStartedAcceptors" :: Text)
       <> "AcceptorsAddr" .= ttAcceptorsAddr)
@@ -149,7 +160,8 @@ instance MetaTrace TracerTrace where
     namespaceFor TracerInitEventQueues = Namespace [] ["EventQueues"]
     namespaceFor TracerInitDone = Namespace [] ["InitDone"]
     namespaceFor TracerStartedLogRotator = Namespace [] ["StartedLogRotator"]
-    namespaceFor TracerStartedPrometheus = Namespace [] ["StartedPrometheus"]
+    namespaceFor TracerStartedPrometheus{} = Namespace [] ["StartedPrometheus"]
+    namespaceFor TracerStartedMonitoring{} = Namespace [] ["StartedMonitoring"]
     namespaceFor TracerStartedAcceptors {} = Namespace [] ["StartedAcceptors"]
     namespaceFor TracerStartedRTView = Namespace [] ["StartedRTView"]
     namespaceFor TracerStartedReforwarder = Namespace [] ["StartedReforwarder"]
@@ -170,6 +182,7 @@ instance MetaTrace TracerTrace where
     severityFor (Namespace _ ["InitDone"]) _ = Just Info
     severityFor (Namespace _ ["StartedLogRotator"]) _ = Just Info
     severityFor (Namespace _ ["StartedPrometheus"]) _ = Just Info
+    severityFor (Namespace _ ["StartedMonitoring"]) _ = Just Info
     severityFor (Namespace _ ["StartedAcceptors"]) _ = Just Info
     severityFor (Namespace _ ["StartedRTView"]) _ = Just Info
     severityFor (Namespace _ ["StartedReforwarder"]) _ = Just Info
@@ -194,6 +207,7 @@ instance MetaTrace TracerTrace where
       , Namespace [] ["InitDone"]
       , Namespace [] ["StartedLogRotator"]
       , Namespace [] ["StartedPrometheus"]
+      , Namespace [] ["StartedMonitoring"]
       , Namespace [] ["StartedAcceptors"]
       , Namespace [] ["StartedRTView"]
       , Namespace [] ["StartedReforwarder"]
