@@ -20,7 +20,8 @@ where
 #endif
 
 import           Cardano.Benchmarking.Compiler (compileOptions)
-import           Cardano.Benchmarking.LogTypes (AsyncBenchmarkControl (..), EnvConsts (..))
+import           Cardano.Benchmarking.LogTypes (AsyncBenchmarkControl (..),
+                   BenchTracers (..), EnvConsts (..), TraceBenchTxSubmit (..))
 import           Cardano.Benchmarking.Script (parseScriptFileAeson, runScript)
 import           Cardano.Benchmarking.Script.Aeson (parseJSONFile, prettyPrint)
 import           Cardano.Benchmarking.Script.Env as Env (emptyEnv, newEnvConsts)
@@ -37,12 +38,15 @@ import           Data.Aeson (fromJSON)
 import           Data.ByteString.Lazy as BSL
 import           Data.Foldable (for_)
 import           Data.Maybe (catMaybes)
+import           Data.Text as T
 import           Data.Text.IO as T
 import           Options.Applicative as Opt
 import           System.Exit
 
 #ifdef UNIX
-import           Control.Concurrent as Conc (myThreadId)
+import           Cardano.Logging as Tracer (traceWith)
+import           Control.Concurrent as Conc (killThread, myThreadId)
+import           Control.Concurrent as Weak (mkWeakThreadId)
 import           Control.Concurrent.Async as Async (cancelWith)
 import           Control.Concurrent.STM as STM (readTVar)
 import           Control.Monad.STM as STM (atomically)
@@ -51,7 +55,13 @@ import           Data.Foldable as Fold (forM_)
 import           Data.List as List (unwords)
 import           Data.Time.Format as Time (defaultTimeLocale, formatTime)
 import           Data.Time.Clock.System as Time (getSystemTime, systemToUTCTime)
-import           System.Posix.Signals as Sig (Handler (CatchInfoOnce), SignalInfo (..), SignalSpecificInfo (..), fullSignalSet, installHandler, sigINT, sigTERM)
+
+import           GHC.Weak as Weak (deRefWeak)
+
+import           System.IO as IO (hPutStrLn, stderr)
+import           System.Posix.Signals as Sig (Handler (CatchInfoOnce),
+                   SignalInfo (..), SignalSpecificInfo (..), installHandler,
+                   sigINT, sigTERM)
 #if MIN_VERSION_base(4,18,0)
 import           Data.Maybe as Maybe (fromMaybe)
 import           GHC.Conc.Sync as Conc (threadLabel)
@@ -111,14 +121,15 @@ runCommand' iocp = do
     Left err -> die $ "tx-generator:Cardano.Command.runCommand handleError: " ++ show err
   installSignalHandler :: IO EnvConsts
   installSignalHandler = do
+    -- The main thread does not appear in the set of asyncs.
+    wkMainTID <- Weak.mkWeakThreadId =<< myThreadId
     envConsts@EnvConsts { .. } <- STM.atomically $ newEnvConsts iocp Nothing
     abc <- STM.atomically $ STM.readTVar envThreads
-    _ <- pure abc
+    _ <- pure (abc, wkMainTID)
 #ifdef UNIX
     let signalHandler = Sig.CatchInfoOnce signalHandler'
         signalHandler' sigInfo = do
           tid <- Conc.myThreadId
-          Just AsyncBenchmarkControl { .. } <- STM.atomically $ STM.readTVar envThreads
           utcTime <- Time.systemToUTCTime <$> Time.getSystemTime
           -- It's meant to match Cardano.Tracers.Handlers.Logs.Utils
           -- The hope was to avoid the package dependency.
@@ -140,13 +151,41 @@ runCommand' iocp = do
                                        , show sigInfo ]
               errorToThrow :: IOError
               errorToThrow = userError labelStr
+              tag = TraceBenchTxSubError . T.pack
+              traceWith' msg = do
+                mBenchTracer <- STM.atomically do readTVar benchTracers
+                case mBenchTracer of
+                  Nothing -> pure ()
+                  Just tracers -> do
+                    let wrappedMsg = tag msg
+                        submittedTracers = btTxSubmit_ tracers
+                    Tracer.traceWith submittedTracers wrappedMsg
 
           Prelude.putStrLn labelStr
-          abcFeeder `Async.cancelWith` errorToThrow
-          Fold.forM_ abcWorkers \work -> do
-            work `Async.cancelWith` errorToThrow
+          IO.hPutStrLn stderr labelStr
+          traceWith' labelStr
+          mABC <- STM.atomically $ STM.readTVar envThreads
+          case mABC of
+            Nothing -> do
+              -- Catching a signal at this point makes it a higher than
+              -- average risk of the tracer not being initialized, so
+              -- this pursues some alternatives.
+              let errMsg = "Signal received before AsyncBenchmarkControl creation."
+              Prelude.putStrLn errMsg
+              IO.hPutStrLn stderr errMsg
+              traceWith' errMsg
+            Just AsyncBenchmarkControl { .. } -> do
+              -- abcShutdown is to be invoked in lieu of:
+              -- abcFeeder `Async.cancelWith` errorToThrow
+              abcShutdown
+              Fold.forM_ abcWorkers \work -> do
+                work `Async.cancelWith` errorToThrow
+              -- The main thread does __NOT__ appear in the above list.
+              -- In order to kill that off, this, or some equivalent,
+              -- absolutely /must/ be done separately.
+              mapM_ Conc.killThread =<< Weak.deRefWeak wkMainTID
     Fold.forM_ [Sig.sigINT, Sig.sigTERM] $ \sig ->
-           Sig.installHandler sig signalHandler $ Just fullSignalSet
+           Sig.installHandler sig signalHandler Nothing
 #endif
     pure envConsts
 
